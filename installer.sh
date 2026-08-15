@@ -4,7 +4,7 @@
 # Installed to /usr/local/bin/veilos-installer on the live ISO.
 # Assets live at /usr/share/veilos/installer/
 
-set -e
+set -euo pipefail
 
 ASSETS_DIR="/usr/share/veilos/installer"
 LOGO_WELCOME="$ASSETS_DIR/logo-welcome.png"
@@ -30,11 +30,31 @@ declare -a MIRROR_OPTIONS=()
 BOOTLOADER_OPTIONS=""
 
 BOOT_MODE=""
+DISK_NAME=""
+DISK=""
+FILESYSTEM=""
+BOOTLOADER=""
+LOCALE=""
+KEYMAP=""
+TIMEZONE=""
+DESKTOP=""
+HOSTNAME=""
+ROOT_PASSWORD=""
+CREATE_USER=""
+USERNAME=""
+USER_PASSWORD=""
+SUDO_ENABLED=""
+MIRROR_COUNTRY=""
+DETECTED_LOCALE="en_US.UTF-8"
+DETECTED_KEYMAP="us"
+RAM_MB=0
+SWAP_TYPE=""
+SWAP_SIZE_MB=""
 
-log()   { echo -e "${GREEN}[veilos]${RESET} $*"; }
-warn()  { echo -e "${YELLOW}[warn]${RESET} $*"; }
+log()   { printf "${GREEN}[veilos]${RESET} %s\n" "$*"; }
+warn()  { printf "${YELLOW}[warn]${RESET} %s\n" "$*"; }
 error() {
-  echo -e "${RED}[error]${RESET} $*" >&2
+  printf "${RED}[error]${RESET} %s\n" "$*" >&2
   exit 1
 }
 
@@ -42,12 +62,12 @@ error() {
 yad_dialog() { yad "$@" --center; }
 
 wizard_title() {
-  echo "VeilOS Installer — $1 ($2/${WIZARD_TOTAL})"
+  printf "VeilOS Installer — %s (%s/%s)" "$1" "$2" "${WIZARD_TOTAL}"
 }
 
 step_banner() {
   local name="$1" num="$2"
-  echo "<span color='#888888'>Step ${num}/${WIZARD_TOTAL}: ${name}</span>"
+  printf "<span color='#888888'>Step %s/%s: %s</span>" "${num}" "${WIZARD_TOTAL}" "${name}"
 }
 
 wizard_nav() {
@@ -67,8 +87,8 @@ wizard_nav() {
 normalize_timezone() {
   local tz="$1"
   case "$tz" in
-  UTC | GMT | UCT) echo "Etc/UTC" ;;
-  *) echo "$tz" ;;
+  UTC | GMT | UCT) printf "Etc/UTC" ;;
+  *) printf "%s" "$tz" ;;
   esac
 }
 
@@ -106,22 +126,59 @@ auto_detect_keymap() {
   log "Keymap: $DETECTED_KEYMAP"
 }
 
+auto_detect_ram() {
+  RAM_MB=$(( $(awk '/MemTotal/{print $2}' /proc/meminfo) / 1024 ))
+  log "Detected RAM: ${RAM_MB}MiB"
+}
+
 network_online() {
   ping -c 1 -W 2 8.8.8.8 &>/dev/null || ping -c 1 -W 2 1.1.1.1 &>/dev/null
+}
+
+live_boot_disks() {
+  # Resolve the physical disk(s) backing the live medium so we never offer
+  # to let the user format the drive they booted from.
+  local -a srcs=() out=() src disk
+  srcs+=("$(findmnt -no SOURCE / 2>/dev/null || true)")
+  for mp in /run/archiso/bootmnt /run/miso/bootmnt; do
+    [[ -d "$mp" ]] && srcs+=("$(findmnt -no SOURCE "$mp" 2>/dev/null || true)")
+  done
+  for src in "${srcs[@]}"; do
+    [[ -n "$src" ]] || continue
+    disk=$(lsblk -no PKNAME "$src" 2>/dev/null || true)
+    [[ -n "$disk" ]] && out+=("$disk")
+  done
+  printf '%s\n' "${out[@]}"
 }
 
 build_disk_rows() {
   DISK_ROWS=()
   local line
+  local -a live_disks
+  readarray -t live_disks < <(live_boot_disks)
 
   while IFS= read -r line; do
     local NAME="" SIZE="" MODEL="" SERIAL="" TRAN="" TYPE=""
-    eval "$line"
+
+    # Safely parse key="value" output without eval
+    while [[ "$line" =~ ([A-Z]+)=\"([^\"]*)\" ]]; do
+      local key="${BASH_REMATCH[1]}"
+      local val="${BASH_REMATCH[2]}"
+      case "$key" in
+        NAME) NAME="$val" ;;
+        SIZE) SIZE="$val" ;;
+        MODEL) MODEL="$val" ;;
+        SERIAL) SERIAL="$val" ;;
+        TRAN) TRAN="$val" ;;
+        TYPE) TYPE="$val" ;;
+      esac
+      line="${line#*"${BASH_REMATCH[0]}"}"
+    done
 
     [[ "$TYPE" == "disk" ]] || continue
     [[ -n "$NAME" ]] || continue
-    # Skip virtual block devices that lsblk still labels as disk
     [[ "$NAME" == zram* || "$NAME" == ram* || "$NAME" == fd* ]] && continue
+    printf '%s\n' "${live_disks[@]}" | grep -qx "$NAME" && continue
 
     DISK_ROWS+=("$NAME" "$SIZE" "${MODEL:-unknown}" "${SERIAL:-—}" "${TRAN:-—}")
   done < <(lsblk -d -n -P -o NAME,SIZE,MODEL,SERIAL,TRAN,TYPE -e7 2>/dev/null)
@@ -133,6 +190,7 @@ build_disk_rows() {
       [[ "$dtype" == "disk" ]] || continue
       [[ -n "$name" ]] || continue
       [[ "$name" == zram* || "$name" == ram* || "$name" == fd* ]] && continue
+      printf '%s\n' "${live_disks[@]}" | grep -qx "$name" && continue
       DISK_ROWS+=("$name" "$size" "${model:-unknown}" "${serial:-—}" "${tran:-—}")
     done < <(lsblk -d -n -o NAME,SIZE,MODEL,SERIAL,TRAN,TYPE -e7 2>/dev/null)
   fi
@@ -169,7 +227,7 @@ scan_disk_warnings() {
   if [[ ${#warns[@]} -gt 0 ]]; then
     printf '%s\n' "${warns[@]}"
   else
-    echo "No existing OS partitions detected (disk may still contain data)."
+    printf "No existing OS partitions detected (disk may still contain data).\n"
   fi
 }
 
@@ -215,25 +273,25 @@ build_mirror_options() {
 
 boot_mode() {
   if [[ -d /sys/firmware/efi ]]; then
-    echo "efi"
+    printf "efi"
   else
-    echo "bios"
+    printf "bios"
   fi
 }
 
 boot_mode_label() {
   if [[ "$BOOT_MODE" == "efi" ]]; then
-    echo "UEFI"
+    printf "UEFI"
   else
-    echo "BIOS (legacy)"
+    printf "BIOS (legacy)"
   fi
 }
 
 boot_mode_banner() {
   if [[ "$BOOT_MODE" == "efi" ]]; then
-    echo "<span color='#00e5c8'><b>Boot mode: UEFI</b></span> — GPT partition table, FAT32 EFI System Partition"
+    printf "<span color='#00e5c8'><b>Boot mode: UEFI</b></span> — GPT partition table, FAT32 EFI System Partition"
   else
-    echo "<span color='#c792ea'><b>Boot mode: BIOS (legacy)</b></span> — MBR partition table, ext4 /boot partition"
+    printf "<span color='#c792ea'><b>Boot mode: BIOS (legacy)</b></span> — MBR partition table, ext4 /boot partition"
   fi
 }
 
@@ -257,18 +315,27 @@ validate_bootloader() {
 partition_plan_text() {
   local disk="$1" fs="$2" mode
   mode=$(boot_mode)
-  local plan=""
+  local plan="" root_num=2 swap_line=""
+  if [[ "${SWAP_TYPE:-none}" == "partition" ]]; then
+    root_num=3
+    swap_line="  <tt>${disk}2</tt> — $((SWAP_SIZE_MB))MiB — swap\n"
+  fi
   if [[ "$mode" == "efi" ]]; then
     plan+="<b>Partition plan (UEFI)</b>\n"
     plan+="  <tt>${disk}1</tt> — 512 MiB — FAT32 — <tt>/boot</tt> (ESP)\n"
-    plan+="  <tt>${disk}2</tt> — remainder — <tt>${fs}</tt> — <tt>/</tt> (root)\n"
+    plan+="${swap_line}"
+    plan+="  <tt>${disk}${root_num}</tt> — remainder — <tt>${fs}</tt> — <tt>/</tt> (root)\n"
   else
     plan+="<b>Partition plan (BIOS)</b>\n"
     plan+="  <tt>${disk}1</tt> — 1 GiB — ext4 — <tt>/boot</tt>\n"
-    plan+="  <tt>${disk}2</tt> — remainder — <tt>${fs}</tt> — <tt>/</tt> (root)\n"
+    plan+="${swap_line}"
+    plan+="  <tt>${disk}${root_num}</tt> — remainder — <tt>${fs}</tt> — <tt>/</tt> (root)\n"
+  fi
+  if [[ "${SWAP_TYPE:-none}" == "swapfile" ]]; then
+    plan+="  <tt>/swapfile</tt> — $((SWAP_SIZE_MB))MiB — on root\n"
   fi
   plan+="\n<span color='#FF8C00'><b>All data on ${disk} will be destroyed.</b></span>"
-  echo -e "$plan"
+  printf "%b" "$plan"
 }
 
 # =============================================================================
@@ -314,7 +381,6 @@ check_requirements() {
       --text="<b>Low memory (${ram_gb}GB)</b>\n\n4GB+ recommended."
   fi
 
-  # Find total size of the largest physical disk available
   local max_disk_bytes
   max_disk_bytes=$(lsblk -d -n -b -o SIZE,TYPE,NAME -e7 2>/dev/null | awk '$2=="disk" && $3 !~ /^(zram|ram|fd)/ {print $1}' | sort -n | tail -n 1)
 
@@ -355,7 +421,7 @@ run_sequential_wizard() {
         "${DISK_ROWS[@]}")
       rc=$?
       [[ $rc -eq 0 && -n "$line" ]] || { [[ $rc -eq 0 ]] && continue; wizard_nav "$rc"; continue; }
-      DISK_NAME=$(echo "$line" | cut -d'|' -f1)
+      DISK_NAME=$(printf "%s" "$line" | cut -d'|' -f1)
       DISK="/dev/$DISK_NAME"
       wizard_nav 0
       ;;
@@ -363,20 +429,54 @@ run_sequential_wizard() {
       local boot_note=""
       [[ "$BOOT_MODE" == "bios" ]] &&
         boot_note="\n\n<span color='#888888'>systemd-boot is UEFI-only and hidden on BIOS systems.</span>"
+      local swap_size_cb
+      swap_size_cb="^2 GiB!Same as RAM (${RAM_MB}MiB)!Half RAM!2x RAM (hibernate)!Custom"
       line=$(yad_dialog --title="$(wizard_title Storage 3)" \
         --width=$WIN_W --height=$WIN_H \
-        --form --separator=$'\n' --quoted-output \
+        --form --separator=$'\n' \
         --field="$(step_banner Storage 3):lbl" "" \
         --field=":lbl" "$(boot_mode_banner)${boot_note}" \
         --field="Root filesystem:cb" "^btrfs!ext4!xfs" \
         --field="Bootloader:cb" "$BOOTLOADER_OPTIONS" \
+        --field="Swap:cb" "^none!swapfile!partition" \
+        --field="Swap size:cb" "$swap_size_cb" \
+        --field="Custom swap size (e.g. 4G, 512M — only used if Swap size=Custom):" "" \
         --button="Next:0" --button="Back:1" --button="Cancel:2")
       rc=$?
       [[ $rc -eq 0 && -n "$line" ]] || { wizard_nav "$rc"; continue; }
-      eval "storage=($line)"
+
+      readarray -t storage <<< "$line"
       FILESYSTEM="${storage[2]:-btrfs}"
       BOOTLOADER="${storage[3]:-grub}"
       validate_bootloader || continue
+
+      SWAP_TYPE="${storage[4]:-none}"
+      local swap_preset="${storage[5]:-2 GiB}"
+      local swap_custom="${storage[6]:-}"
+
+      if [[ "$SWAP_TYPE" == "none" ]]; then
+        SWAP_SIZE_MB=0
+      else
+        case "$swap_preset" in
+          "2 GiB")               SWAP_SIZE_MB=2048 ;;
+          "Same as RAM"*)        SWAP_SIZE_MB=$RAM_MB ;;
+          "Half RAM")            SWAP_SIZE_MB=$((RAM_MB / 2)) ;;
+          "2x RAM (hibernate)")  SWAP_SIZE_MB=$((RAM_MB * 2)) ;;
+          Custom)
+            if [[ "$swap_custom" =~ ^([0-9]+)[Gg]$ ]]; then
+              SWAP_SIZE_MB=$(( ${BASH_REMATCH[1]} * 1024 ))
+            elif [[ "$swap_custom" =~ ^([0-9]+)[Mm]?$ ]]; then
+              SWAP_SIZE_MB="${BASH_REMATCH[1]}"
+            else
+              yad_dialog --error --title="VeilOS Installer" --width=480 \
+                --text="Custom swap size must look like <tt>4G</tt> or <tt>512M</tt>."
+              continue
+            fi
+            ;;
+          *) SWAP_SIZE_MB=2048 ;;
+        esac
+        [[ "$SWAP_SIZE_MB" -gt 0 ]] || { yad_dialog --error --title="VeilOS Installer" --width=480 --text="Swap size must be greater than 0."; continue; }
+      fi
       wizard_nav 0
       ;;
     4)
@@ -385,7 +485,7 @@ run_sequential_wizard() {
       km_cb=$(IFS='!'; echo "${KEYMAP_OPTIONS[*]}")
       line=$(yad_dialog --title="$(wizard_title Locale 4)" \
         --width=$WIN_W --height=$WIN_H \
-        --form --separator=$'\n' --quoted-output \
+        --form --separator=$'\n' \
         --field="$(step_banner Locale 4):lbl" "" \
         --field="System locale:cb" "^${DETECTED_LOCALE}!en_US.UTF-8!de_DE.UTF-8!fr_FR.UTF-8!es_ES.UTF-8!ja_JP.UTF-8!pt_BR.UTF-8" \
         --field="Console keymap:cb" "$km_cb" \
@@ -393,7 +493,8 @@ run_sequential_wizard() {
         --button="Next:0" --button="Back:1" --button="Cancel:2")
       rc=$?
       [[ $rc -eq 0 && -n "$line" ]] || { wizard_nav "$rc"; continue; }
-      eval "locale=($line)"
+
+      readarray -t locale <<< "$line"
       LOCALE="${locale[1]:-$DETECTED_LOCALE}"
       KEYMAP="${locale[2]:-$DETECTED_KEYMAP}"
       TIMEZONE="${locale[3]:-$TIMEZONE}"
@@ -414,13 +515,14 @@ run_sequential_wizard() {
         FALSE i3     "i3")
       rc=$?
       [[ $rc -eq 0 && -n "$line" ]] || { wizard_nav "$rc"; continue; }
-      DESKTOP=$(echo "$line" | cut -d'|' -f1)
+      # FIX: Fetch index -f2 (Desktop Name) instead of -f1 (Radio selection TRUE/FALSE)
+      DESKTOP=$(printf "%s" "$line" | cut -d'|' -f2)
       wizard_nav 0
       ;;
     6)
       line=$(yad_dialog --title="$(wizard_title Users 6)" \
         --width=$WIN_W --height=$WIN_H \
-        --form --separator=$'\n' --quoted-output \
+        --form --separator=$'\n' \
         --field="$(step_banner Users 6):lbl" "" \
         --field="Hostname" "veilos" \
         --field="Root password:hd" "" \
@@ -432,7 +534,8 @@ run_sequential_wizard() {
         --button="Next:0" --button="Back:1" --button="Cancel:2")
       rc=$?
       [[ $rc -eq 0 && -n "$line" ]] || { wizard_nav "$rc"; continue; }
-      eval "users=($line)"
+
+      readarray -t users <<< "$line"
       HOSTNAME="${users[1]:-veilos}"
       ROOT_PASSWORD="${users[2]}"
       local root_confirm="${users[3]}"
@@ -464,7 +567,7 @@ run_sequential_wizard() {
       fi
       line=$(yad_dialog --title="$(wizard_title Network 7)" \
         --width=$WIN_W --height=$WIN_H \
-        --form --separator=$'\n' --quoted-output \
+        --form --separator=$'\n' \
         --field="$(step_banner Network 7):lbl" "" \
         --field="Status:lbl" "$net_status" \
         --field="Open network manager (nmtui) now:chk" FALSE \
@@ -472,8 +575,9 @@ run_sequential_wizard() {
         --button="Next:0" --button="Back:1" --button="Cancel:2")
       rc=$?
       [[ $rc -eq 0 ]] || { wizard_nav "$rc"; continue; }
-      eval "net=($line)"
-      if [[ "${net[2]}" == "TRUE" ]]; then
+
+      readarray -t net <<< "$line"
+      if [[ "${net[2]:-FALSE}" == "TRUE" ]]; then
         launch_nmtui
       fi
       wizard_nav 0
@@ -483,33 +587,46 @@ run_sequential_wizard() {
       mir_cb=$(IFS='!'; echo "${MIRROR_OPTIONS[*]}")
       line=$(yad_dialog --title="$(wizard_title Mirror 8)" \
         --width=$WIN_W --height=$WIN_H \
-        --form --separator=$'\n' --quoted-output \
+        --form --separator=$'\n' \
         --field="$(step_banner Mirror 8):lbl" "" \
         --field="Mirror country:cb" "$mir_cb" \
         --field=":lbl" "Automatic uses reflector to pick the fastest mirror." \
         --button="Next:0" --button="Back:1" --button="Cancel:2")
       rc=$?
       [[ $rc -eq 0 && -n "$line" ]] || { wizard_nav "$rc"; continue; }
-      eval "mirror=($line)"
+
+      readarray -t mirror <<< "$line"
       MIRROR_COUNTRY="${mirror[1]:-automatic}"
       wizard_nav 0
       ;;
     9)
+      if [[ "${SWAP_TYPE:-none}" == "partition" ]]; then
+        local disk_bytes disk_mb
+        disk_bytes=$(lsblk -b -d -n -o SIZE "$DISK" 2>/dev/null || echo 0)
+        disk_mb=$((disk_bytes / 1024 / 1024))
+        if (( disk_mb > 0 && SWAP_SIZE_MB + 15360 > disk_mb )); then
+          yad_dialog --error --title="VeilOS Installer" --width=520 \
+            --text="Requested swap (${SWAP_SIZE_MB}MiB) leaves less than 15GiB for root on a ${disk_mb}MiB disk.\n\nGo back and shrink the swap size or pick a swapfile instead."
+          WIZARD_STEP=3
+          continue
+        fi
+      fi
       local summary_img=() plan
       [[ -f "$LOGO_SUMMARY" ]] && summary_img=(--image="$LOGO_SUMMARY")
       plan=$(partition_plan_text "$DISK" "$FILESYSTEM")
       line=$(yad_dialog --title="$(wizard_title Summary 9)" \
         --width=$WIN_W --height=$WIN_H \
         "${summary_img[@]}" \
-        --form --separator=$'\n' --quoted-output \
+        --form --separator=$'\n' \
         --field="$(step_banner Summary 9):lbl" "" \
         --field=":lbl" "$plan" \
         --field="Disk <tt>${DISK_NAME}</tt> — type name to confirm:txt" "" \
         --button="Install:0" --button="Back:1" --button="Cancel:2")
       rc=$?
       [[ $rc -eq 0 && -n "$line" ]] || { wizard_nav "$rc"; continue; }
-      eval "summary=($line)"
-      local disk_confirm="${summary[2]}"
+
+      readarray -t summary <<< "$line"
+      local disk_confirm="${summary[2]:-}"
       [[ "$disk_confirm" == "$DISK_NAME" ]] || {
         yad_dialog --error --title="VeilOS Installer" --width=480 --text="Type <tt>${DISK_NAME}</tt> exactly to confirm."
         continue
@@ -555,7 +672,9 @@ show_final_confirmation() {
   confirm_text+="  Locale: <tt>$LOCALE</tt>  Keymap: <tt>$KEYMAP</tt>\n"
   confirm_text+="  Timezone: <tt>$TIMEZONE</tt>  Mirror: <tt>$MIRROR_COUNTRY</tt>\n"
   confirm_text+="  Bootloader: <tt>$BOOTLOADER</tt>  Desktop: <tt>$DESKTOP</tt>\n"
-  confirm_text+="  Hostname: <tt>$HOSTNAME</tt>"
+  confirm_text+="  Swap: <tt>${SWAP_TYPE:-none}</tt>"
+  [[ "${SWAP_TYPE:-none}" != "none" ]] && confirm_text+="  (${SWAP_SIZE_MB}MiB)"
+  confirm_text+="\n  Hostname: <tt>$HOSTNAME</tt>"
 
   yad_dialog --title="VeilOS Installer" --width=$WIN_W --height=$WIN_H \
     --text="$confirm_text" \
@@ -566,55 +685,79 @@ show_final_confirmation() {
 }
 
 write_config() {
-  # Remove existing config file to prevent ownership/permission conflicts
   rm -f "$CONFIG_FILE"
 
-  # Write config with restricted permissions so passwords aren't world-readable
-  (umask 077; cat >"$CONFIG_FILE" <<EOF
-DISK="$DISK"
-FILESYSTEM="$FILESYSTEM"
-BOOTLOADER="$BOOTLOADER"
-BOOT_MODE="$BOOT_MODE"
-LOCALE="$LOCALE"
-KEYMAP="$KEYMAP"
-TIMEZONE="$TIMEZONE"
-MIRROR_COUNTRY="$MIRROR_COUNTRY"
-HOSTNAME="$HOSTNAME"
-ROOT_PASSWORD="$ROOT_PASSWORD"
-CREATE_USER="$CREATE_USER"
-USERNAME="$USERNAME"
-USER_PASSWORD="$USER_PASSWORD"
-SUDO_ENABLED="$SUDO_ENABLED"
-DESKTOP="$DESKTOP"
-EOF
+  # IMPORTANT: the backend `source`s this file as root. Interpolating values
+  # straight into double quotes let a password/hostname containing $(...) ,
+  # backticks, or a stray " break out and run as root when sourced. %q quotes
+  # every value so it's always treated as a literal string.
+  (
+    umask 077
+    {
+      printf 'DISK=%q\n' "$DISK"
+      printf 'FILESYSTEM=%q\n' "$FILESYSTEM"
+      printf 'BOOTLOADER=%q\n' "$BOOTLOADER"
+      printf 'BOOT_MODE=%q\n' "$BOOT_MODE"
+      printf 'LOCALE=%q\n' "$LOCALE"
+      printf 'KEYMAP=%q\n' "$KEYMAP"
+      printf 'TIMEZONE=%q\n' "$TIMEZONE"
+      printf 'MIRROR_COUNTRY=%q\n' "$MIRROR_COUNTRY"
+      printf 'HOSTNAME=%q\n' "$HOSTNAME"
+      printf 'ROOT_PASSWORD=%q\n' "$ROOT_PASSWORD"
+      printf 'CREATE_USER=%q\n' "$CREATE_USER"
+      printf 'USERNAME=%q\n' "$USERNAME"
+      printf 'USER_PASSWORD=%q\n' "$USER_PASSWORD"
+      printf 'SUDO_ENABLED=%q\n' "$SUDO_ENABLED"
+      printf 'DESKTOP=%q\n' "$DESKTOP"
+      printf 'SWAP_TYPE=%q\n' "$SWAP_TYPE"
+      printf 'SWAP_SIZE_MB=%q\n' "$SWAP_SIZE_MB"
+    } >"$CONFIG_FILE"
   )
   log "Config written to $CONFIG_FILE"
 }
 
 run_installation() {
   local logfile="/tmp/veilos-install.log"
+  local exitcode_file="/tmp/veilos-install.exitcode"
   local install_status=0
 
   : >"$logfile"
-  set -o pipefail
+  rm -f "$exitcode_file"
 
-  sudo bash "$BACKEND" 2>&1 | tee "$logfile" | while IFS= read -r line; do
+  # NOTE: exit status of `cmd | tee | yad --progress` is yad's exit status
+  # (the last stage of the pipe), NOT the backend's — a failed partition step
+  # or pacstrap error used to get reported as a successful install. The
+  # backend now writes its real exit code to $exitcode_file via a trap; that
+  # file is the source of truth, this pipeline's own $? is not.
+  while IFS= read -r line; do
     if [[ "$line" =~ VEILOS_PROGRESS:([^:]+):([0-9]+) ]]; then
       echo "${BASH_REMATCH[2]}"
       echo "# ${BASH_REMATCH[1]}"
     fi
-  done | yad_dialog --progress \
+  done < <(sudo bash "$BACKEND" 2>&1 | tee "$logfile") | yad_dialog --progress \
     --title="VeilOS Installer" \
     --auto-close --no-escape \
     --width=600 --height=150 \
     --value=0 \
-    --text="${TR[running]}" || install_status=$?
+    --text="${TR[running]}"
 
-  set +o pipefail
+  if [[ -f "$exitcode_file" ]]; then
+    install_status=$(<"$exitcode_file")
+  else
+    # Backend crashed before it could even set the trap (e.g. sudo denied) —
+    # treat missing sentinel as failure rather than assuming success.
+    install_status=1
+  fi
 
-  if [[ $install_status -ne 0 ]]; then
+  if command -v shred &>/dev/null; then
+    shred -u "$CONFIG_FILE" 2>/dev/null || rm -f "$CONFIG_FILE"
+  else
+    rm -f "$CONFIG_FILE"
+  fi
+
+  if [[ "$install_status" -ne 0 ]]; then
     yad_dialog --error --title="VeilOS Installer" --width=560 \
-      --text="Installation failed.\n\nLog: <tt>$logfile</tt>"
+      --text="Installation failed (exit ${install_status}).\n\nLog: <tt>$logfile</tt>"
     exit 1
   fi
 
@@ -630,7 +773,8 @@ main() {
   auto_detect_timezone
   auto_detect_locale
   auto_detect_keymap
-  load_translations "$(echo "$DETECTED_LOCALE" | cut -d_ -f1)"
+  auto_detect_ram
+  load_translations "$(printf "%s" "$DETECTED_LOCALE" | cut -d_ -f1)"
 
   build_disk_rows
   build_bootloader_options
