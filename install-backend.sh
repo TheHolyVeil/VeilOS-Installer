@@ -51,6 +51,16 @@ source "$CONFIG_FILE"
 log "Starting VeilOS installation..."
 log "Target: $DISK | $FILESYSTEM | $BOOTLOADER | $DESKTOP"
 
+# Helper to build proper partition paths (handles /dev/nvme0n1 -> /dev/nvme0n1p1)
+get_partition_path() {
+  local disk="$1" part_num="$2"
+  if [[ "$disk" =~ [0-9]$ ]]; then
+    echo "${disk}p${part_num}"
+  else
+    echo "${disk}${part_num}"
+  fi
+}
+
 # =============================================================================
 # MIRROR
 # =============================================================================
@@ -88,10 +98,11 @@ partition_disk() {
 
   umount -R /mnt 2>/dev/null || true
 
+  BOOT_PARTITION=$(get_partition_path "$DISK" 1)
+  ROOT_PARTITION=$(get_partition_path "$DISK" 2)
+
   if [[ -d /sys/firmware/efi ]]; then
     log "EFI mode"
-    BOOT_PARTITION="${DISK}1"
-    ROOT_PARTITION="${DISK}2"
     parted -s "$DISK" mklabel gpt
     parted -s "$DISK" mkpart primary fat32 1MiB 513MiB
     parted -s "$DISK" set 1 esp on
@@ -99,8 +110,6 @@ partition_disk() {
     BOOT_TYPE="efi"
   else
     log "BIOS mode"
-    BOOT_PARTITION="${DISK}1"
-    ROOT_PARTITION="${DISK}2"
     parted -s "$DISK" mklabel msdos
     parted -s "$DISK" mkpart primary ext4 1MiB 1025MiB
     parted -s "$DISK" set 1 boot on
@@ -143,8 +152,9 @@ mount_partitions() {
     return 0
   fi
 
-  mkdir -p /mnt /mnt/boot
+  mkdir -p /mnt
   mount "$ROOT_PARTITION" /mnt
+  mkdir -p /mnt/boot
   mount "$BOOT_PARTITION" /mnt/boot
 }
 
@@ -157,11 +167,30 @@ run_pacstrap() {
     return 0
   fi
 
+  # Core base packages required for every install
   local packages=(
-    base linux linux-firmware grub efibootmgr limine systemd-boot
-    networkmanager vim nano zsh git sudo openssh fastfetch kbd
+    base linux linux-firmware networkmanager vim nano zsh git sudo openssh fastfetch kbd
   )
 
+  # Dynamically append ONLY the selected bootloader
+  case "$BOOTLOADER" in
+    grub)
+      packages+=(grub)
+      ;;
+    limine)
+      packages+=(limine)
+      ;;
+    systemd-boot)
+      # systemd-boot is included in systemd (base), no extra package needed
+      ;;
+  esac
+
+  # Only include UEFI tools if booted in EFI mode
+  if [[ "$BOOT_TYPE" == "efi" ]]; then
+    packages+=(efibootmgr)
+  fi
+
+  log "Pacstrap package list: ${packages[*]}"
   pacstrap -K /mnt "${packages[@]}"
 }
 
@@ -183,11 +212,6 @@ chroot_setup() {
     return 0
   fi
 
-  if [[ -d /run/archiso/bootmnt/arch/boot/archiso_root/etc ]]; then
-    cp -r /run/archiso/bootmnt/arch/boot/archiso_root/etc/* /mnt/etc/ 2>/dev/null ||
-      warn "Could not copy archiso configs"
-  fi
-
   echo "$HOSTNAME" >/mnt/etc/hostname
 
   if grep -q "^#*$LOCALE" /mnt/etc/locale.gen; then
@@ -203,6 +227,9 @@ chroot_setup() {
 
   ln -sf "/usr/share/zoneinfo/$TIMEZONE" /mnt/etc/localtime
   arch-chroot /mnt hwclock --systohc 2>/dev/null || true
+
+  # Enable core network service
+  arch-chroot /mnt systemctl enable NetworkManager.service 2>/dev/null || true
 
   mkdir -p /mnt/var/log
 
@@ -222,70 +249,32 @@ install_bootloader() {
     return 0
   fi
 
-  cat >/tmp/chroot_bootloader.sh <<'CHROOTEOF'
-#!/usr/bin/env bash
-set -e
-BOOTLOADER="$1"
-BOOT_TYPE="$2"
-DISK="$3"
+  [[ -z "$BOOT_TYPE" ]] && BOOT_TYPE=$([[ -d /sys/firmware/efi ]] && echo efi || echo bios)
 
-case "$BOOTLOADER" in
-grub)
-  if [[ "$BOOT_TYPE" == "efi" ]]; then
-    grub-install --target=x86_64-efi --efi-directory=/boot --bootloader-id=VeilOS
-  else
-    grub-install --target=i386-pc "$DISK"
-  fi
-  grub-mkconfig -o /boot/grub/grub.cfg
-  ;;
-systemd-boot)
-  if [[ "$BOOT_TYPE" != "efi" ]]; then
-    echo "systemd-boot requires UEFI firmware"
-    exit 1
-  fi
-  bootctl install
-  mkdir -p /boot/loader/entries
-  cat >/boot/loader/entries/veilos.conf <<EOF
+  case "$BOOTLOADER" in
+  grub)
+    log "Installing GRUB..."
+    if [[ "$BOOT_TYPE" == "efi" ]]; then
+      arch-chroot /mnt grub-install --target=x86_64-efi --efi-directory=/boot --bootloader-id=VeilOS || error "GRUB EFI install failed"
+    else
+      arch-chroot /mnt grub-install --target=i386-pc "$DISK" || error "GRUB BIOS install failed"
+    fi
+    arch-chroot /mnt grub-mkconfig -o /boot/grub/grub.cfg || error "GRUB config failed"
+    ;;
+  systemd-boot)
+    [[ "$BOOT_TYPE" == "efi" ]] || error "systemd-boot requires UEFI"
+    log "Installing systemd-boot..."
+    arch-chroot /mnt bootctl install || error "systemd-boot install failed"
+    mkdir -p /mnt/boot/loader/entries
+    cat > /mnt/boot/loader/entries/veilos.conf << 'BOOTCONF'
 title VeilOS
 linux /vmlinuz-linux
 initrd /initramfs-linux.img
 options root=LABEL=root rw
-EOF
-  ;;
-limine)
-  mkdir -p /boot/limine /boot/EFI/BOOT
-  if [[ -f /usr/share/limine/BOOTX64.EFI ]]; then
-    cp /usr/share/limine/BOOTX64.EFI /boot/EFI/BOOT/BOOTX64.EFI
-  fi
-  if [[ -f /usr/share/limine/limine-bios.sys ]]; then
-    cp /usr/share/limine/limine-bios.sys /boot/limine/
-  fi
-  cat >/boot/limine/limine.cfg <<EOF
-timeout: 5
-default_entry: 1
-
-/veilos
-    protocol: linux
-    path: boot():/vmlinuz-linux
-    cmdline: root=LABEL=root rw quiet
-    module_path: boot():/initramfs-linux.img
-EOF
-  if [[ "$BOOT_TYPE" == "efi" ]]; then
-    limine limine-install "$DISK" 2>/dev/null || true
-  else
-    limine limine-install "$DISK" 2>/dev/null || true
-  fi
-  ;;
-*)
-  echo "Unknown bootloader: $BOOTLOADER"
-  exit 1
-  ;;
-esac
-CHROOTEOF
-
-  chmod +x /tmp/chroot_bootloader.sh
-  arch-chroot /mnt /tmp/chroot_bootloader.sh "$BOOTLOADER" "$BOOT_TYPE" "$DISK"
-  rm -f /tmp/chroot_bootloader.sh
+BOOTCONF
+    ;;
+  esac
+  log "Bootloader installed"
 }
 
 setup_users() {
@@ -295,31 +284,26 @@ setup_users() {
     return 0
   fi
 
-  cat >/tmp/chroot_users.sh <<'CHROOTEOF'
+  mkdir -p /mnt/tmp
+  cat >/mnt/tmp/chroot_users.sh <<CHROOTEOF
 #!/usr/bin/env bash
 set -e
-ROOT_PASSWD="$1"
-CREATE_USER="$2"
-USERNAME="$3"
-USER_PASSWD="$4"
-SUDO_ENABLED="$5"
+echo "root:${ROOT_PASSWORD}" | chpasswd
 
-echo "root:$ROOT_PASSWD" | chpasswd
-
-if [[ "$CREATE_USER" == "true" ]]; then
-  useradd -m -s /usr/bin/zsh "$USERNAME"
-  echo "$USERNAME:$USER_PASSWD" | chpasswd
-  if [[ "$SUDO_ENABLED" == "true" ]]; then
-    usermod -aG wheel "$USERNAME"
+if [[ "${CREATE_USER}" == "true" ]]; then
+  useradd -m -s /usr/bin/zsh "${USERNAME}" || true
+  echo "${USERNAME}:${USER_PASSWORD}" | chpasswd
+  if [[ "${SUDO_ENABLED}" == "true" ]]; then
+    usermod -aG wheel "${USERNAME}"
     echo "%wheel ALL=(ALL:ALL) ALL" >/etc/sudoers.d/wheel
     chmod 440 /etc/sudoers.d/wheel
   fi
 fi
 CHROOTEOF
 
-  chmod +x /tmp/chroot_users.sh
-  arch-chroot /mnt /tmp/chroot_users.sh "$ROOT_PASSWORD" "$CREATE_USER" "$USERNAME" "$USER_PASSWORD" "$SUDO_ENABLED"
-  rm -f /tmp/chroot_users.sh
+  chmod +x /mnt/tmp/chroot_users.sh
+  arch-chroot /mnt /tmp/chroot_users.sh
+  rm -f /mnt/tmp/chroot_users.sh
 }
 
 setup_desktop() {
@@ -348,8 +332,8 @@ main() {
     log "====== DEBUG: INSTALLATION PLAN ======"
     log "Disk: $DISK ($BOOT_MODE)"
     log "  Bootloader: $BOOTLOADER"
-    log "  ${DISK}1 — boot"
-    log "  ${DISK}2 — root ($FILESYSTEM)"
+    log "  $(get_partition_path "$DISK" 1) — boot"
+    log "  $(get_partition_path "$DISK" 2) — root ($FILESYSTEM)"
     log "Locale: $LOCALE | Keymap: $KEYMAP | TZ: $TIMEZONE"
     log "Mirror: $MIRROR_COUNTRY | Bootloader: $BOOTLOADER"
     log "Desktop: $DESKTOP | Hostname: $HOSTNAME"

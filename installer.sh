@@ -38,7 +38,8 @@ error() {
   exit 1
 }
 
-yad_dialog() { yad --center "$@"; }
+# Always append --center at the end so action flags (--error, --progress, etc.) come first
+yad_dialog() { yad "$@" --center; }
 
 wizard_title() {
   echo "VeilOS Installer — $1 ($2/${WIZARD_TOTAL})"
@@ -246,7 +247,7 @@ build_bootloader_options() {
 
 validate_bootloader() {
   if [[ "$BOOT_MODE" == "bios" && "$BOOTLOADER" == "systemd-boot" ]]; then
-    yad_dialog --title="VeilOS Installer" --error --width=480 \
+    yad_dialog --error --title="VeilOS Installer" --width=480 \
       --text="<b>systemd-boot requires UEFI firmware.</b>\n\nThis system booted in BIOS mode. Choose GRUB or Limine."
     return 1
   fi
@@ -301,7 +302,7 @@ load_translations() {
 check_requirements() {
   log "Checking requirements..."
   if ! network_online; then
-    yad_dialog --title="VeilOS Installer" --warning --width=560 \
+    yad_dialog --warning --title="VeilOS Installer" --width=560 \
       --button="Continue:0" --button="Cancel:1" \
       --text="<b>No network detected</b>\n\nConnect in the Network step or continue offline (may fail)."
     [[ $? -eq 0 ]] || exit 1
@@ -309,11 +310,11 @@ check_requirements() {
 
   local ram_gb=$(( $(awk '/MemTotal/{print $2}' /proc/meminfo) / 1024 / 1024 ))
   if [[ $ram_gb -lt 4 ]]; then
-    yad_dialog --title="VeilOS Installer" --warning --width=560 \
+    yad_dialog --warning --title="VeilOS Installer" --width=560 \
       --text="<b>Low memory (${ram_gb}GB)</b>\n\n4GB+ recommended."
   fi
 
-  # Find the size of the largest physical disk available (in bytes)
+  # Find total size of the largest physical disk available
   local max_disk_bytes
   max_disk_bytes=$(lsblk -d -n -b -o SIZE,TYPE,NAME -e7 2>/dev/null | awk '$2=="disk" && $3 !~ /^(zram|ram|fd)/ {print $1}' | sort -n | tail -n 1)
 
@@ -439,8 +440,8 @@ run_sequential_wizard() {
       USERNAME="${users[5]:-user}"
       USER_PASSWORD="${users[6]}"
       SUDO_ENABLED="${users[7]:-TRUE}"
-      [[ -n "$ROOT_PASSWORD" ]] || { yad_dialog --error --text="Root password is required."; continue; }
-      [[ "$ROOT_PASSWORD" == "$root_confirm" ]] || { yad_dialog --error --text="Root passwords do not match."; continue; }
+      [[ -n "$ROOT_PASSWORD" ]] || { yad_dialog --error --title="VeilOS Installer" --text="Root password is required."; continue; }
+      [[ "$ROOT_PASSWORD" == "$root_confirm" ]] || { yad_dialog --error --title="VeilOS Installer" --text="Root passwords do not match."; continue; }
       if [[ "$CREATE_USER" == "TRUE" ]]; then
         CREATE_USER="true"
         [[ -n "$USERNAME" ]] || USERNAME="user"
@@ -510,7 +511,7 @@ run_sequential_wizard() {
       eval "summary=($line)"
       local disk_confirm="${summary[2]}"
       [[ "$disk_confirm" == "$DISK_NAME" ]] || {
-        yad_dialog --error --width=480 --text="Type <tt>${DISK_NAME}</tt> exactly to confirm."
+        yad_dialog --error --title="VeilOS Installer" --width=480 --text="Type <tt>${DISK_NAME}</tt> exactly to confirm."
         continue
       }
       [[ -f "/usr/share/zoneinfo/$TIMEZONE" ]] || error "Invalid timezone: $TIMEZONE"
@@ -565,6 +566,9 @@ show_final_confirmation() {
 }
 
 write_config() {
+  # Remove existing config file to prevent ownership/permission conflicts
+  rm -f "$CONFIG_FILE"
+
   # Write config with restricted permissions so passwords aren't world-readable
   (umask 077; cat >"$CONFIG_FILE" <<EOF
 DISK="$DISK"
@@ -603,18 +607,18 @@ run_installation() {
     --title="VeilOS Installer" \
     --auto-close --no-escape \
     --width=600 --height=150 \
-    --percentage=0 \
+    --value=0 \
     --text="${TR[running]}" || install_status=$?
 
   set +o pipefail
 
   if [[ $install_status -ne 0 ]]; then
-    yad_dialog --title="VeilOS Installer" --error --width=560 \
+    yad_dialog --error --title="VeilOS Installer" --width=560 \
       --text="Installation failed.\n\nLog: <tt>$logfile</tt>"
     exit 1
   fi
 
-  yad_dialog --title="VeilOS Installer" --question --width=520 \
+  yad_dialog --question --title="VeilOS Installer" --width=520 \
     --text="<b>${TR[complete]}</b>\n\n${TR[reboot]}" && sudo reboot
 }
 
