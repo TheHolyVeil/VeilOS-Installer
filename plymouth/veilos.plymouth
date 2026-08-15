@@ -1,0 +1,21 @@
+[Plymouth Theme]
+Name=VeilOS
+Description=VeilOS boot splash (deep purple / TWM palette)
+ModuleName=two-step
+
+[two-step]
+ImageDir=/usr/share/plymouth/themes/veilos
+DialogHorizontalAlignment=.5
+DialogVerticalAlignment=.6
+TitleFont=Sans 18
+Font=Sans 10
+BackgroundStartColor=0x1a0f2e
+BackgroundEndColor=0x08040f
+Transition=none
+TransitionDuration=0.0
+BackgroundTile=background.png
+WatermarkHorizontalAlignment=.5
+WatermarkVerticalAlignment=.42
+Watermark=logo.png
+ProgressBarBackgroundColor=0x2d1b4e
+ProgressBarForegroundColor=0xa78bda

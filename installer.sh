@@ -50,6 +50,8 @@ DETECTED_KEYMAP="us"
 RAM_MB=0
 SWAP_TYPE=""
 SWAP_SIZE_MB=""
+LOGIN_MANAGER=""
+LOGIN_MANAGER_CMD=""
 
 log()   { printf "${GREEN}[veilos]${RESET} %s\n" "$*"; }
 warn()  { printf "${YELLOW}[warn]${RESET} %s\n" "$*"; }
@@ -517,6 +519,26 @@ run_sequential_wizard() {
       [[ $rc -eq 0 && -n "$line" ]] || { wizard_nav "$rc"; continue; }
       # FIX: Fetch index -f2 (Desktop Name) instead of -f1 (Radio selection TRUE/FALSE)
       DESKTOP=$(printf "%s" "$line" | cut -d'|' -f2)
+
+      local lm_line
+      lm_line=$(yad_dialog --title="$(wizard_title Desktop 5)" \
+        --width=$WIN_W --height=$WIN_H \
+        --form --separator=$'\n' \
+        --field=":lbl" "Login manager for $DESKTOP" \
+        --field="Login manager:cb" "^auto (desktop default)!sddm!gdm!lightdm!velogin!none!custom" \
+        --field=":lbl" "velogin installs TheHolyVeil/veilTDC's VeilLogin automatically. custom runs your own command below." \
+        --field="Custom install command (runs inside the chroot as root — only used if Login manager=custom):" "" \
+        --button="Next:0" --button="Back:1" --button="Cancel:2")
+      rc=$?
+      [[ $rc -eq 0 && -n "$lm_line" ]] || { wizard_nav "$rc"; continue; }
+      readarray -t lm <<< "$lm_line"
+      LOGIN_MANAGER="${lm[1]:-auto (desktop default)}"
+      LOGIN_MANAGER_CMD="${lm[3]:-}"
+      if [[ "$LOGIN_MANAGER" == "custom" && -z "$LOGIN_MANAGER_CMD" ]]; then
+        yad_dialog --error --title="VeilOS Installer" --width=480 \
+          --text="Login manager is set to custom but no install command was given."
+        continue
+      fi
       wizard_nav 0
       ;;
     6)
@@ -672,6 +694,7 @@ show_final_confirmation() {
   confirm_text+="  Locale: <tt>$LOCALE</tt>  Keymap: <tt>$KEYMAP</tt>\n"
   confirm_text+="  Timezone: <tt>$TIMEZONE</tt>  Mirror: <tt>$MIRROR_COUNTRY</tt>\n"
   confirm_text+="  Bootloader: <tt>$BOOTLOADER</tt>  Desktop: <tt>$DESKTOP</tt>\n"
+  confirm_text+="  Login manager: <tt>${LOGIN_MANAGER:-auto}</tt>\n"
   confirm_text+="  Swap: <tt>${SWAP_TYPE:-none}</tt>"
   [[ "${SWAP_TYPE:-none}" != "none" ]] && confirm_text+="  (${SWAP_SIZE_MB}MiB)"
   confirm_text+="\n  Hostname: <tt>$HOSTNAME</tt>"
@@ -711,6 +734,8 @@ write_config() {
       printf 'DESKTOP=%q\n' "$DESKTOP"
       printf 'SWAP_TYPE=%q\n' "$SWAP_TYPE"
       printf 'SWAP_SIZE_MB=%q\n' "$SWAP_SIZE_MB"
+      printf 'LOGIN_MANAGER=%q\n' "$LOGIN_MANAGER"
+      printf 'LOGIN_MANAGER_CMD=%q\n' "$LOGIN_MANAGER_CMD"
     } >"$CONFIG_FILE"
   )
   log "Config written to $CONFIG_FILE"
