@@ -1,13 +1,15 @@
 #!/usr/bin/env bash
-# installer.sh — VeilOS YAD installer
+# veilos-installer — VeilOS YAD installer
 # Sequential wizard (Wayland-safe — no X11 notebook/plug mode)
+# Installed to /usr/local/bin/veilos-installer on the live ISO.
+# Assets live at /usr/share/veilos/installer/
 
 set -e
 
-SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
-ASSETS_DIR="$SCRIPT_DIR/assets"
+ASSETS_DIR="/usr/share/veilos/installer"
 LOGO_WELCOME="$ASSETS_DIR/logo-welcome.png"
 LOGO_SUMMARY="$ASSETS_DIR/logo-summary.png"
+BACKEND="/usr/lib/veilos/install-backend.sh"
 CONFIG_FILE="/tmp/veilos-install.conf"
 
 WIN_W=720
@@ -29,8 +31,8 @@ BOOTLOADER_OPTIONS=""
 
 BOOT_MODE=""
 
-log() { echo -e "${GREEN}[veilos]${RESET} $*"; }
-warn() { echo -e "${YELLOW}[warn]${RESET} $*"; }
+log()   { echo -e "${GREEN}[veilos]${RESET} $*"; }
+warn()  { echo -e "${YELLOW}[warn]${RESET} $*"; }
 error() {
   echo -e "${RED}[error]${RESET} $*" >&2
   exit 1
@@ -90,7 +92,7 @@ auto_detect_locale() {
   es) DETECTED_LOCALE="es_ES.UTF-8" ;;
   ja) DETECTED_LOCALE="ja_JP.UTF-8" ;;
   pt) DETECTED_LOCALE="pt_BR.UTF-8" ;;
-  *) DETECTED_LOCALE="en_US.UTF-8" ;;
+  *)  DETECTED_LOCALE="en_US.UTF-8" ;;
   esac
   log "Locale: $DETECTED_LOCALE"
 }
@@ -311,8 +313,14 @@ check_requirements() {
       --text="<b>Low memory (${ram_gb}GB)</b>\n\n4GB+ recommended."
   fi
 
-  local disk_gb=$(( $(df / | awk 'END{print $4}') / 1024 / 1024 ))
-  [[ $disk_gb -ge 20 ]] || error "Need 20GB free on live system, have ${disk_gb}GB"
+  # Find the size of the largest physical disk available (in bytes)
+  local max_disk_bytes
+  max_disk_bytes=$(lsblk -d -n -b -o SIZE,TYPE,NAME -e7 2>/dev/null | awk '$2=="disk" && $3 !~ /^(zram|ram|fd)/ {print $1}' | sort -n | tail -n 1)
+
+  local max_disk_gb=$(( ${max_disk_bytes:-0} / 1024 / 1024 / 1024 ))
+  [[ $max_disk_gb -ge 20 ]] || error "No target drive with at least 20GB space found (largest drive: ${max_disk_gb}GB)"
+
+  [[ -f "$BACKEND" ]] || error "Backend not found: $BACKEND"
 }
 
 # =============================================================================
@@ -397,12 +405,12 @@ run_sequential_wizard() {
         --text="$(step_banner Desktop 5)" \
         --column=Pick --column=Desktop --column=Notes \
         --button="Next:0" --button="Back:1" --button="Cancel:2" \
-        TRUE veil "VeilOS compositor (AUR)" \
-        FALSE sway "Sway + Woven (AUR)" \
+        TRUE  veil   "VeilOS compositor (AUR)" \
+        FALSE sway   "Sway + Woven (AUR)" \
         FALSE plasma "KDE Plasma" \
-        FALSE gnome "GNOME" \
-        FALSE xfce "XFCE" \
-        FALSE i3 "i3")
+        FALSE gnome  "GNOME" \
+        FALSE xfce   "XFCE" \
+        FALSE i3     "i3")
       rc=$?
       [[ $rc -eq 0 && -n "$line" ]] || { wizard_nav "$rc"; continue; }
       DESKTOP=$(echo "$line" | cut -d'|' -f1)
@@ -523,8 +531,8 @@ launch_nmtui() {
     if command -v "$term" &>/dev/null; then
       case "$term" in
       kitty) kitty --hold nmtui ;;
-      foot) foot nmtui ;;
-      *) "$term" -e nmtui ;;
+      foot)  foot nmtui ;;
+      *)     "$term" -e nmtui ;;
       esac
       return
     fi
@@ -557,7 +565,8 @@ show_final_confirmation() {
 }
 
 write_config() {
-  cat >"$CONFIG_FILE" <<EOF
+  # Write config with restricted permissions so passwords aren't world-readable
+  (umask 077; cat >"$CONFIG_FILE" <<EOF
 DISK="$DISK"
 FILESYSTEM="$FILESYSTEM"
 BOOTLOADER="$BOOTLOADER"
@@ -574,18 +583,18 @@ USER_PASSWORD="$USER_PASSWORD"
 SUDO_ENABLED="$SUDO_ENABLED"
 DESKTOP="$DESKTOP"
 EOF
+  )
   log "Config written to $CONFIG_FILE"
 }
 
 run_installation() {
-  local backend="$SCRIPT_DIR/install-backend.sh"
   local logfile="/tmp/veilos-install.log"
   local install_status=0
 
   : >"$logfile"
   set -o pipefail
 
-  sudo bash "$backend" 2>&1 | tee "$logfile" | while IFS= read -r line; do
+  sudo bash "$BACKEND" 2>&1 | tee "$logfile" | while IFS= read -r line; do
     if [[ "$line" =~ VEILOS_PROGRESS:([^:]+):([0-9]+) ]]; then
       echo "${BASH_REMATCH[2]}"
       echo "# ${BASH_REMATCH[1]}"
