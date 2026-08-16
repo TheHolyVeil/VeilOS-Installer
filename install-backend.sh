@@ -134,6 +134,18 @@ else
   warn "$PLYMOUTH_THEME_SRC not found on the live ISO — boot will use the default (unbranded) splash."
 fi
 
+# Onboard tools (machina, yay-bin, glasspad) now come from your own veilos
+# repo in pacman.conf. Refresh sync dbs and confirm they actually resolve
+# before touching the disk — a repo misconfiguration should fail here, not
+# halfway through pacstrap after the disk is already wiped.
+ONBOARD_PACKAGES=(machina yay-bin glasspad)
+log "Checking veilos repo for onboard packages: ${ONBOARD_PACKAGES[*]}..."
+pacman -Sy &>/dev/null || warn "pacman -Sy failed — check network/mirrors before continuing."
+if ! pacman -Si "${ONBOARD_PACKAGES[@]}" &>/dev/null; then
+  error "One or more onboard packages (${ONBOARD_PACKAGES[*]}) aren't resolvable — check the [veilos] repo entry in pacman.conf on the live ISO and that its server is reachable."
+fi
+log "Onboard packages resolved OK."
+
 # Refuse to touch the medium we're currently booted/running from
 LIVE_SRC=$(findmnt -no SOURCE / 2>/dev/null || true)
 for mp in /run/archiso/bootmnt /run/miso/bootmnt; do
@@ -212,7 +224,7 @@ if [[ "$BOOT_MODE" == "efi" ]]; then
 else
   log "Creating MBR partitions (BIOS)..."
   parted -s "$DISK" mklabel msdos
-  parted -s "$DISK" mkpart primary ext4 1MiB 1025MiB
+  parted -s "$DISK" mkpart primary fat32 1MiB 1025MiB
   parted -s "$DISK" set 1 boot on
   if [[ "$SWAP_TYPE" == "partition" ]]; then
     swap_end_mib=$((1025 + SWAP_SIZE_MB))
@@ -238,8 +250,16 @@ else
   wait_for_partition "$PART_ROOT"
 
   emit_progress "Formatting partitions" 20
-  log "Formatting boot partition ($PART_BOOT) as ext4..."
-  mkfs.ext4 -F -L "BOOT" "$PART_BOOT"
+  # FAT32, not ext4: Limine's (and to a lesser extent GRUB's) BIOS-mode
+  # filesystem drivers have very limited ext4 support. Modern mkfs.ext4
+  # enables features by default (metadata_csum, 64bit, orphan_file) that a
+  # normal Linux mount reads without issue but a minimal boot-time ext4
+  # parser can't — the file is genuinely on disk and still gets reported as
+  # "not found" because the driver can't walk the filesystem structure to
+  # find it. FAT32 has none of this ambiguity and every bootloader reads it
+  # identically, which is also why the EFI ESP above is FAT32.
+  log "Formatting boot partition ($PART_BOOT) as FAT32..."
+  mkfs.vfat -F 32 -n "BOOT" "$PART_BOOT"
 fi
 
 if [[ "$SWAP_TYPE" == "partition" ]]; then
@@ -341,14 +361,17 @@ case "$LOGIN_MANAGER" in
   *) error "Unknown LOGIN_MANAGER: $LOGIN_MANAGER" ;;
 esac
 
-EXTRA_PKGS=""
-[[ "$LOGIN_MANAGER" == "custom" ]] && EXTRA_PKGS="curl ca-certificates"
-[[ "$LOGIN_MANAGER" == "velogin" ]] && EXTRA_PKGS="curl ca-certificates seatd"
+EXTRA_PKGS="curl ca-certificates"
+[[ "$LOGIN_MANAGER" == "velogin" ]] && EXTRA_PKGS="$EXTRA_PKGS seatd"
 [[ "$PLYMOUTH_AVAILABLE" -eq 1 ]] && EXTRA_PKGS="$EXTRA_PKGS plymouth"
-# base-devel + git are here unconditionally: yay has to be built from the AUR
-# (there's no official package for it), and setup-veil.sh/setup-sway-woven.sh
-# both need a working AUR helper to pull in Veil/Woven's own AUR deps.
+# base-devel + git: no longer needed to bootstrap yay itself (it's a plain
+# package in the veilos repo now), but yay still needs them on hand to build
+# any *actual* AUR package later, and setup-veil.sh/setup-sway-woven.sh may
+# pull further AUR deps through it.
 EXTRA_PKGS="$EXTRA_PKGS base-devel git"
+# Onboard tools, now plain packages in your own repo — pacstrap installs them
+# in the same pass as everything else, no throwaway build user required.
+EXTRA_PKGS="$EXTRA_PKGS ${ONBOARD_PACKAGES[*]}"
 
 BASE_PACKAGES="base linux linux-firmware sudo networkmanager $BOOTLOADER_PKG $DESKTOP_PKGS $DM_PKG $EXTRA_PKGS"
 
@@ -368,6 +391,15 @@ for check in etc/os-release usr/bin/bash usr/lib/systemd/systemd; do
   [[ -e "/mnt/$check" ]] || error "pacstrap reported success but /mnt/$check is missing — the base system was not actually installed. Check the log above for pacman errors."
 done
 log "Verified base system is present (os-release, bash, systemd all found)."
+
+# pacstrap only ever READS the live ISO's pacman.conf to fetch packages for
+# /mnt — it never copies the file itself in. Without this, the install ends
+# up with the pacman package's stock template (no [veilos] repo), so
+# machina/glasspad/yay-bin would have no way to update or reinstall post-boot.
+log "Copying live pacman.conf (with the veilos repo) into the install..."
+cp /etc/pacman.conf /mnt/etc/pacman.conf
+log "Copying ranked mirrorlist into the install..."
+cp /etc/pacman.d/mirrorlist /mnt/etc/pacman.d/mirrorlist
 
 # -----------------------------------------------------------------------------
 # 7. GENERATE FSTAB & SYSTEM CONFIGURATION
@@ -488,46 +520,6 @@ if [[ "$CREATE_USER" == "true" ]]; then
   fi
 fi
 
-# -----------------------------------------------------------------------------
-# 8b. AUR: bootstrap yay, then pull in the onboard toolset through it
-# -----------------------------------------------------------------------------
-# There's no official package for yay — it has to be built from the AUR, and
-# makepkg refuses outright to run as root. We use a throwaway build user with
-# NOPASSWD sudo (there's no TTY here for makepkg's internal `sudo pacman -U`
-# to prompt on) rather than depend on whatever sudo policy the real account
-# ended up with, then delete it again once the build is done.
-emit_progress "Bootstrapping AUR helper (yay)" 62
-log "Creating throwaway build user for makepkg..."
-arch-chroot /mnt useradd -m -G wheel -s /bin/bash veilbuild
-echo "veilbuild ALL=(ALL) NOPASSWD: ALL" > /mnt/etc/sudoers.d/veilbuild
-chmod 0440 /mnt/etc/sudoers.d/veilbuild
-
-log "Building yay from the AUR..."
-arch-chroot /mnt runuser -u veilbuild -- bash -c '
-  set -e
-  cd /tmp
-  git clone --depth=1 https://aur.archlinux.org/yay-bin.git
-  cd yay-bin
-  makepkg -si --noconfirm
-' || error "yay bootstrap failed — check the log above for the actual makepkg/git error."
-
-# TODO(abyss): these AUR package names are placeholders — confirm the real
-# published names for Machina and Glasspad (and whatever the third tool
-# was) and update this list. If either isn't actually on the AUR yet and
-# is a curl-install like VeilLogin instead, it belongs up in the
-# LOGIN_MANAGER-style custom-command flow, not here.
-AUR_ONBOARD_PACKAGES=(machina glasspad)
-if [[ ${#AUR_ONBOARD_PACKAGES[@]} -gt 0 ]]; then
-  emit_progress "Installing onboard tools" 63
-  log "Installing onboard tools via yay: ${AUR_ONBOARD_PACKAGES[*]}..."
-  arch-chroot /mnt runuser -u veilbuild -- yay -S --noconfirm --needed "${AUR_ONBOARD_PACKAGES[@]}" \
-    || warn "One or more onboard AUR packages failed to install (${AUR_ONBOARD_PACKAGES[*]}) — check the log above and the actual package names."
-fi
-
-log "Removing throwaway build user..."
-arch-chroot /mnt userdel -r veilbuild 2>/dev/null || warn "Could not fully remove veilbuild user — harmless, but you may want to clean it up manually."
-rm -f /mnt/etc/sudoers.d/veilbuild
-
 # Enable display manager if one was selected (auto default, or explicit choice)
 if [[ -n "$DM_SERVICE" ]]; then
   log "Enabling login manager: $DM_SERVICE..."
@@ -605,25 +597,37 @@ case "$BOOTLOADER" in
         --loader '\EFI\BOOT\BOOTX64.EFI' --label "VeilOS" 2>/dev/null \
         || warn "efibootmgr NVRAM entry failed — fallback path \\EFI\\BOOT\\BOOTX64.EFI should still boot on most firmware."
     else
-      # CRITICAL: limine's BIOS stage-2 loader reads /limine-bios.sys from the
-      # root of the boot partition at boot time. bios-install alone only
-      # embeds stage-1/2 in the MBR gap — without this file present the
-      # system fails to boot after install. This was previously missing.
-      [[ -f /mnt/usr/share/limine/limine-bios.sys ]] || error "limine package didn't install /usr/share/limine/limine-bios.sys — is 'limine' actually in the package list?"
-      cp /mnt/usr/share/limine/limine-bios.sys /mnt/boot/limine-bios.sys
+      # CRITICAL: the MBR-embedded stage1/2 written by `limine bios-install`
+      # below comes from the LIVE ISO's limine binary, and it must be the
+      # EXACT SAME VERSION as limine-bios.sys or it rejects it outright —
+      # printing "stage 3 file not found" even though the file is right
+      # there, because a version mismatch fails validation silently rather
+      # than reporting itself as a version error. Pulling limine-bios.sys
+      # from the chroot's separately-pacstrapped limine package (which can
+      # drift to a different version than the live ISO's) was exactly that
+      # bug. Fix: source it from the SAME live-ISO limine install as the
+      # binary actually doing bios-install, not from the target.
+      [[ -f /usr/share/limine/limine-bios.sys ]] || error "limine-bios.sys not found on the LIVE ISO at /usr/share/limine/ — is 'limine' actually installed there (not just pacstrapped into the target)?"
+      cp /usr/share/limine/limine-bios.sys /mnt/boot/limine-bios.sys
       log "Running Limine BIOS installation on device $DISK..."
       limine bios-install "$DISK"
     fi
 
-    # Generate Limine configuration
+    # Generate Limine configuration.
+    # boot():/path is current Limine's path resolver ("the partition Limine
+    # itself booted from") — boot:///path (triple-slash, no parens) is the
+    # older/wrong syntax and fails to resolve, which is exactly why the
+    # kernel showed up as "doesn't exist" despite being at the right path.
+    # kernel_cmdline is likewise the current key name (plain "cmdline" is
+    # silently ignored by newer Limine, not an error, just no cmdline set).
     cat <<EOF > /mnt/boot/limine.conf
 timeout: 5
 
 /VeilOS
     protocol: linux
-    kernel_path: boot:///vmlinuz-linux
-    cmdline: root=PARTUUID=$(blkid -s PARTUUID -o value "$PART_ROOT") $CMDLINE_EXTRA
-    module_path: boot:///initramfs-linux.img
+    kernel_path: boot():/vmlinuz-linux
+    kernel_cmdline: root=PARTUUID=$(blkid -s PARTUUID -o value "$PART_ROOT") $CMDLINE_EXTRA
+    module_path: boot():/initramfs-linux.img
 EOF
     if [[ "$BOOT_MODE" == "efi" ]]; then
       [[ -f /mnt/boot/EFI/BOOT/BOOTX64.EFI ]] || error "Limine EFI install verification failed: BOOTX64.EFI missing from ESP."
@@ -666,8 +670,30 @@ if [[ "$SWAP_TYPE" == "partition" ]]; then
 fi
 
 log "Unmounting target partitions..."
-umount -R /mnt
-MOUNTED=0
+# arch-chroot commonly leaves a stray dbus-daemon/gpg-agent running inside
+# the chroot's mount namespace even after the chroot session itself exits
+# (spawned by pacman-key/makepkg hooks) — that's the usual cause of "target
+# is busy" here, not anything actually wrong with the install. Kill anything
+# still holding /mnt open, then retry a few times before giving up.
+unmount_ok=0
+for attempt in 1 2 3 4 5; do
+  if umount -R /mnt 2>/dev/null; then
+    unmount_ok=1
+    break
+  fi
+  command -v fuser &>/dev/null && { fuser -km /mnt 2>/dev/null || true; }
+  sleep 1
+done
+
+if [[ "$unmount_ok" -eq 1 ]]; then
+  MOUNTED=0
+else
+  # Everything that actually matters — partitioning, packages, bootloader,
+  # users, fstab — is already fully written to disk at this point. A stuck
+  # unmount only affects the live session's view of the disk, not the
+  # install itself, so this is a warning, not a fatal error.
+  warn "Could not cleanly unmount /mnt after several attempts — the install itself is already complete and should boot fine. You may need 'umount -R /mnt' manually (or just reboot) before reusing this live session for another install."
+fi
 
 # Config file holds plaintext root/user passwords — don't leave it lying around.
 if command -v shred &>/dev/null; then
